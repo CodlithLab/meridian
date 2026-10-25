@@ -27,7 +27,7 @@ function makePortfolio(
     asset: p.asset,
     size: D(p.size),
     basis: D("0"),
-    memberId: p.memberId,
+    ...(p.memberId === undefined ? {} : { memberId: p.memberId }),
   }));
 
   return {
@@ -258,12 +258,14 @@ describe("validateComposition – cash-buffer", () => {
   it("flags a violation when cash buffer falls below minimum", () => {
     const members = [makeMember("a", "50", [{ asset: USDC, size: "950" }])];
     const portfolio = makePortfolio("50", [{ asset: USDC, size: "950" }]);
-    // total = 1000, cash = 50, buffer = 0.05 < 0.1
+    const orders = [{ asset: USDC, size: D("10") }];
+    // total = 1000, projected cash = 40, buffer = 0.04 < 0.1
     const result = validateComposition(
       { minCashBuffer: D("0.1") },
       members,
       portfolio,
-      PRICES
+      PRICES,
+      orders
     );
     expect(result.valid).toBe(false);
     const v = result.violations[0];
@@ -271,6 +273,41 @@ describe("validateComposition – cash-buffer", () => {
     if (v?.kind === "cash-buffer") {
       expect(v.limit.toString()).toBe("0.1");
     }
+    expect(() => enforceReject(result)).toThrow(/cash buffer/);
+  });
+});
+
+describe("validateComposition – member-weight orders", () => {
+  it("counts proposed orders toward the member's weight", () => {
+    const members = [
+      makeMember("heavy", "1000", []),
+      makeMember("light", "1000", []),
+    ];
+    const portfolio = makePortfolio("1000", []);
+    const result = validateComposition(
+      { maxMemberWeight: D("0.7") },
+      members,
+      portfolio,
+      PRICES,
+      [{ asset: USDC, size: D("800"), memberId: "heavy" }]
+    );
+
+    expect(result.valid).toBe(false);
+    expect(result.violations[0]?.kind).toBe("member-weight");
+  });
+
+  it("rejects non-positive prices before computing weights", () => {
+    const members = [makeMember("a", "0", [{ asset: USDC, size: "100" }])];
+    const portfolio = makePortfolio("1000", []);
+
+    expect(() =>
+      validateComposition(
+        { maxMemberWeight: D("0.5") },
+        members,
+        portfolio,
+        new Map([[USDC, D("0")]])
+      )
+    ).toThrow(RangeError);
   });
 });
 
@@ -338,6 +375,24 @@ describe("enforceReject", () => {
 // ---------------------------------------------------------------------------
 
 describe("enforceClamp", () => {
+  it("refuses to clamp when total value is non-positive", () => {
+    const result = {
+      valid: false,
+      violations: [
+        {
+          kind: "aggregate-exposure" as const,
+          asset: USDC,
+          actual: D("1"),
+          limit: D("0.5"),
+        },
+      ],
+    };
+
+    expect(() =>
+      enforceClamp(result, [], PRICES, D("0"), makePortfolio("0", []))
+    ).toThrow(CompositionConstraintError);
+  });
+
   it("returns orders unchanged when the composition is valid", () => {
     const orders = [{ asset: USDC, size: D("100") }];
     const portfolio = makePortfolio("900", [{ asset: USDC, size: "100" }]);
