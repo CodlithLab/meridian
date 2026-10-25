@@ -12,13 +12,15 @@
  *   - "clamp":  reduce offending orders before they are applied and return a
  *               `ClampResult` describing what was trimmed.
  *
- * Constraints are validated at init and after every rebalance. Members never
- * mutate one another's orders; the composition applies the policy when merging
- * member orders.
+ * The validator evaluates the post-trade composition: current positions plus
+ * any proposed orders at the current marks. Members never mutate one another's
+ * orders; the composition applies the policy when merging member orders.
  */
-import { FixedPointDecimal } from "../types";
+import { FixedPointDecimal, UnknownAssetError } from "../types";
 import type { AssetSymbol } from "../types";
 import type { Order, PortfolioView } from "../strategy";
+
+const UNIT = 10_000_000n;
 
 // ---------------------------------------------------------------------------
 // Constraints
@@ -30,8 +32,8 @@ import type { Order, PortfolioView } from "../strategy";
  */
 export interface CompositionConstraints {
   /**
-   * Maximum fraction of total portfolio value that any single member may
-   * represent (0 < maxMemberWeight ≤ 1). Checked after rebalance.
+   * Maximum fraction of total portfolio value held as one member's gross
+   * position exposure (0 < maxMemberWeight ≤ 1). Checked after rebalance.
    */
   readonly maxMemberWeight?: FixedPointDecimal | undefined;
 
@@ -59,10 +61,7 @@ export interface CompositionConstraints {
 // ---------------------------------------------------------------------------
 
 export type ConstraintViolationKind =
-  | "member-weight"
-  | "aggregate-exposure"
-  | "member-count"
-  | "cash-buffer";
+  "member-weight" | "aggregate-exposure" | "member-count" | "cash-buffer";
 
 export interface MemberWeightViolation {
   readonly kind: "member-weight";
@@ -155,22 +154,25 @@ export interface ValidationResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Pure validator. Computes aggregate per-asset exposure across all members
- * and checks every enabled constraint. Returns every violation found; the
- * caller chooses the enforcement policy (reject or clamp).
+ * Pure validator. Computes post-trade gross exposure across members and checks
+ * every enabled constraint. Returns every violation found; the caller chooses
+ * the enforcement policy (reject or clamp).
  *
- * @param constraints  - The limits to enforce.
- * @param members      - Per-member portfolio views (must be non-empty).
- * @param portfolio    - The shared portfolio view (for cash and total value).
- * @param prices       - Current prices, used to compute portfolio value.
+ * @param constraints   - The limits to enforce.
+ * @param members       - Per-member portfolio views (must be non-empty).
+ * @param portfolio     - The shared portfolio view (for cash and total value).
+ * @param prices        - Current prices, used to compute portfolio value.
+ * @param proposedOrders - Orders that have not been applied yet.
  * @throws {CompositionConstraintError} when a constraint definition is itself
  *   invalid (e.g. maxMemberWeight > 1).
+ * @throws {UnknownAssetError} when a held or ordered asset has no price.
  */
 export function validateComposition(
   constraints: CompositionConstraints,
   members: readonly MemberView[],
   portfolio: PortfolioView,
-  prices: ReadonlyMap<AssetSymbol, FixedPointDecimal>
+  prices: ReadonlyMap<AssetSymbol, FixedPointDecimal>,
+  proposedOrders: readonly Order[] = []
 ): ValidationResult {
   validateConstraintDefinitions(constraints);
 
@@ -194,13 +196,16 @@ export function validateComposition(
     return { violations, valid: violations.length === 0 };
   }
 
-  const one = FixedPointDecimal.fromStroops(10_000_000n); // 1.0
-
   // -- member-weight ----------------------------------------------------------
   if (constraints.maxMemberWeight !== undefined) {
     const limit = constraints.maxMemberWeight;
     for (const member of members) {
-      const memberValue = member.portfolio.totalValue(prices);
+      const memberValue = grossMemberValue(
+        member,
+        portfolio,
+        proposedOrders,
+        prices
+      );
       const weight = memberValue.div(totalValue);
       if (weight.compareTo(limit) > 0) {
         violations.push({
@@ -216,41 +221,14 @@ export function validateComposition(
   // -- aggregate-exposure per asset -------------------------------------------
   if (constraints.maxAggregateExposure !== undefined) {
     const limit = constraints.maxAggregateExposure;
+    const exposures = aggregateExposures(portfolio, proposedOrders, prices);
 
-    // Collect all asset symbols across members.
-    const assetSet = new Set<AssetSymbol>();
-    for (const member of members) {
-      for (const position of member.portfolio.positions()) {
-        assetSet.add(position.asset);
-      }
-    }
-
-    for (const asset of assetSet) {
-      const price = prices.get(asset);
-      if (price === undefined || price.toStroops() <= 0n) continue;
-
-      // Sum the absolute notional across every member that holds this asset.
-      let aggregateNotionalStroops = 0n;
-      for (const member of members) {
-        const position = member.portfolio.getPosition(asset);
-        if (position === undefined) continue;
-        const sizeStroops = position.size.toStroops();
-        const abs = sizeStroops < 0n ? -sizeStroops : sizeStroops;
-        // notional = |size| * price (both in stroops, result in stroops²/stroop = stroops)
-        const notionalStroops =
-          (abs * price.toStroops()) / 10_000_000n;
-        aggregateNotionalStroops += notionalStroops;
-      }
-
-      const aggregateExposure = FixedPointDecimal.fromStroops(
-        (aggregateNotionalStroops * 10_000_000n) / totalStroops
-      );
-
-      if (aggregateExposure.compareTo(limit) > 0) {
+    for (const [asset, exposure] of exposures) {
+      if (exposure.compareTo(limit) > 0) {
         violations.push({
           kind: "aggregate-exposure",
           asset,
-          actual: aggregateExposure,
+          actual: exposure,
           limit,
         });
       }
@@ -260,7 +238,9 @@ export function validateComposition(
   // -- cash-buffer ------------------------------------------------------------
   if (constraints.minCashBuffer !== undefined) {
     const limit = constraints.minCashBuffer;
-    const cashBuffer = portfolio.cash.div(totalValue);
+    const cashBuffer = projectedCash(portfolio, proposedOrders, prices).div(
+      totalValue
+    );
     if (cashBuffer.compareTo(limit) < 0) {
       violations.push({
         kind: "cash-buffer",
@@ -307,79 +287,121 @@ export interface ClampResult {
 }
 
 /**
- * Enforce constraints with the "clamp" policy: reduce offending orders so
- * they no longer breach any aggregate-exposure limit, then return the trimmed
- * orders together with the violations that triggered clamping.
+ * Enforce constraints with the "clamp" policy: reduce offending orders so the
+ * post-trade composition no longer breaches an aggregate-exposure limit, then
+ * return the trimmed orders together with the violations that were clamped.
  *
- * Only `aggregate-exposure` violations are clamped directly on orders; the
- * other violation kinds (member-weight, member-count, cash-buffer) are
- * reported but do not alter orders because they cannot be corrected by trimming
- * a single order in isolation.
+ * Only `aggregate-exposure` violations can be clamped. Member-count,
+ * member-weight and cash-buffer violations are rejected because trimming
+ * orders cannot guarantee those limits are met.
  *
  * @param result      - The validation result from `validateComposition`.
  * @param orders      - The orders to clamp.
  * @param prices      - Current prices used to scale order notionals.
  * @param totalValue  - Total portfolio value used to compute the limit notional.
+ * @param portfolio   - Current portfolio state, used to measure existing exposure.
+ * @throws {CompositionConstraintError} when current exposure already breaches
+ *   the limit or a violation cannot be fixed by trimming orders.
  */
 export function enforceClamp(
   result: ValidationResult,
   orders: readonly Order[],
   prices: ReadonlyMap<AssetSymbol, FixedPointDecimal>,
   totalValue: FixedPointDecimal,
-  constraints: CompositionConstraints
+  portfolio: PortfolioView
 ): ClampResult {
   if (result.valid) {
     return { orders: [...orders], clampedViolations: [] };
   }
 
-  const clampedViolations: ConstraintViolation[] = [...result.violations];
+  const totalStroops = totalValue.toStroops();
+  if (totalStroops <= 0n) {
+    throw new CompositionConstraintError(
+      "constraint-violated",
+      "cannot clamp a composition with non-positive total value",
+      result.violations
+    );
+  }
 
-  // Build a mutable copy of the orders indexed by asset.
-  const mutableOrders: Order[] = orders.map((o) => ({ ...o }));
+  const clampedViolations: AggregateExposureViolation[] = [];
+  const mutableOrders: Order[] = orders.map((order) => ({ ...order }));
 
-  // For each aggregate-exposure violation, scale down orders for that asset.
-  const exposureViolations = result.violations.filter(
-    (v): v is AggregateExposureViolation => v.kind === "aggregate-exposure"
-  );
-
-  for (const violation of exposureViolations) {
-    const { asset, limit } = violation;
-    const price = prices.get(asset);
-    if (price === undefined || price.toStroops() <= 0n) continue;
-
-    const totalValueStroops = totalValue.toStroops();
-    if (totalValueStroops <= 0n) continue;
-
-    // Maximum allowed absolute notional for this asset.
-    const maxNotionalStroops =
-      (limit.toStroops() * totalValueStroops) / 10_000_000n;
-
-    // Current total absolute notional from the proposed orders.
-    let currentNotionalStroops = 0n;
-    for (const order of mutableOrders) {
-      if (order.asset !== asset) continue;
-      const sizeStroops = order.size.toStroops();
-      const abs = sizeStroops < 0n ? -sizeStroops : sizeStroops;
-      currentNotionalStroops += (abs * price.toStroops()) / 10_000_000n;
+  for (const violation of result.violations) {
+    if (violation.kind !== "aggregate-exposure") {
+      throw new CompositionConstraintError(
+        "constraint-violated",
+        `cannot clamp ${violation.kind} violation by trimming orders: ${describeViolation(violation)}`,
+        [violation]
+      );
     }
 
-    if (currentNotionalStroops === 0n) continue;
+    const price = requirePrice(prices, violation.asset);
+    const targetStroops = (violation.limit.toStroops() * totalStroops) / UNIT;
+    const currentStroops = currentAssetExposureStroops(
+      portfolio,
+      violation.asset,
+      price.toStroops()
+    );
 
-    // Scale factor to apply to every order for this asset.
-    // scaleStroops = maxNotional / currentNotional (as a fixed-point fraction).
-    const scaleStroops =
-      (maxNotionalStroops * 10_000_000n) / currentNotionalStroops;
+    if (currentStroops >= targetStroops) {
+      throw new CompositionConstraintError(
+        "constraint-violated",
+        `cannot clamp ${violation.asset} exposure because current exposure already breaches the limit: ${describeViolation(violation)}`,
+        [violation]
+      );
+    }
 
-    for (let idx = 0; idx < mutableOrders.length; idx++) {
-      const order = mutableOrders[idx]!;
-      if (order.asset !== asset) continue;
-      const sizeStroops = order.size.toStroops();
-      const clampedStroops = (sizeStroops * scaleStroops) / 10_000_000n;
-      mutableOrders[idx] = {
+    const availableStroops = targetStroops - currentStroops;
+    const increasing: Array<{
+      readonly index: number;
+      readonly currentSize: bigint;
+      readonly increase: bigint;
+    }> = [];
+
+    let increasingStroops = 0n;
+    for (let index = 0; index < mutableOrders.length; index += 1) {
+      const order = mutableOrders[index]!;
+      if (order.asset !== violation.asset) continue;
+
+      const currentSize = currentMemberSize(
+        portfolio,
+        order.memberId,
+        order.asset
+      );
+      const orderSize = order.size.toStroops();
+      const currentAbs = absStroops(currentSize);
+      const newAbs = absStroops(currentSize + orderSize);
+      if (newAbs <= currentAbs) continue;
+
+      const increase = newAbs - currentAbs;
+      increasing.push({ index, currentSize, increase });
+      increasingStroops += (increase * price.toStroops()) / UNIT;
+    }
+
+    if (increasingStroops <= availableStroops) continue;
+
+    const scaleStroops = (availableStroops * UNIT) / increasingStroops;
+    for (const { index, currentSize, increase } of increasing) {
+      const order = mutableOrders[index]!;
+      const clampedIncrease = (increase * scaleStroops) / UNIT;
+      const currentAbs = absStroops(currentSize);
+      const clampedAbs = currentAbs + clampedIncrease;
+      const clampedSize =
+        currentSize === 0n
+          ? order.size.toStroops() < 0n
+            ? -clampedAbs
+            : clampedAbs
+          : currentSize < 0n
+            ? -clampedAbs
+            : clampedAbs;
+
+      mutableOrders[index] = {
         ...order,
-        size: FixedPointDecimal.fromStroops(clampedStroops),
+        size: FixedPointDecimal.fromStroops(clampedSize - currentSize),
       };
     }
+
+    clampedViolations.push(violation);
   }
 
   return { orders: mutableOrders, clampedViolations };
@@ -393,19 +415,23 @@ export type ConstraintEnforcementMode = "reject" | "clamp";
 
 export interface CompositionConstraintConfig {
   readonly constraints: CompositionConstraints;
-  /** Default: "reject". */
-  readonly mode: ConstraintEnforcementMode;
+  /** Defaults to "reject". */
+  readonly mode?: ConstraintEnforcementMode | undefined;
 }
 
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
 
-function validateConstraintDefinitions(
+/**
+ * Throws when a constraint definition itself is invalid. Exported so callers
+ * that validate a composition before any positions exist (for example at
+ * strategy init) can still reject malformed limits.
+ */
+export function validateConstraintDefinitions(
   constraints: CompositionConstraints
 ): void {
-  const one = FixedPointDecimal.fromStroops(10_000_000n);
-  const zero = FixedPointDecimal.fromStroops(0n);
+  const one = FixedPointDecimal.fromStroops(UNIT);
 
   if (constraints.maxMemberWeight !== undefined) {
     const v = constraints.maxMemberWeight;
@@ -428,7 +454,10 @@ function validateConstraintDefinitions(
   }
 
   if (constraints.maxMemberCount !== undefined) {
-    if (!Number.isInteger(constraints.maxMemberCount) || constraints.maxMemberCount < 1) {
+    if (
+      !Number.isInteger(constraints.maxMemberCount) ||
+      constraints.maxMemberCount < 1
+    ) {
       throw new CompositionConstraintError(
         "invalid-max-member-count",
         `maxMemberCount must be a positive integer, received ${constraints.maxMemberCount}`
@@ -445,6 +474,152 @@ function validateConstraintDefinitions(
       );
     }
   }
+}
+
+function absStroops(value: bigint): bigint {
+  return value < 0n ? -value : value;
+}
+
+function notionalStroops(size: bigint, price: bigint): bigint {
+  return (absStroops(size) * price) / UNIT;
+}
+
+function requirePrice(
+  prices: ReadonlyMap<AssetSymbol, FixedPointDecimal>,
+  asset: AssetSymbol
+): FixedPointDecimal {
+  const price = prices.get(asset);
+  if (price === undefined) throw new UnknownAssetError(asset);
+  if (price.toStroops() <= 0n) {
+    throw new RangeError(`price for ${asset} must be positive`);
+  }
+  return price;
+}
+
+function ownsMember(ownerId: string, memberId: string | undefined): boolean {
+  return (
+    memberId === ownerId ||
+    (memberId !== undefined && memberId.startsWith(`${ownerId}/`))
+  );
+}
+
+function ownsNestedMember(
+  ownerId: string,
+  memberId: string | undefined
+): boolean {
+  return (
+    memberId !== undefined &&
+    memberId !== ownerId &&
+    memberId.startsWith(`${ownerId}/`)
+  );
+}
+
+function addSize(
+  sizes: Map<AssetSymbol, bigint>,
+  asset: AssetSymbol,
+  size: bigint
+): void {
+  sizes.set(asset, (sizes.get(asset) ?? 0n) + size);
+}
+
+function grossMemberValue(
+  member: MemberView,
+  portfolio: PortfolioView,
+  proposedOrders: readonly Order[],
+  prices: ReadonlyMap<AssetSymbol, FixedPointDecimal>
+): FixedPointDecimal {
+  const sizes = new Map<AssetSymbol, bigint>();
+  for (const position of member.portfolio.positions()) {
+    addSize(sizes, position.asset, position.size.toStroops());
+  }
+  for (const position of portfolio.positions()) {
+    if (!ownsNestedMember(member.id, position.memberId)) continue;
+    addSize(sizes, position.asset, position.size.toStroops());
+  }
+  for (const order of proposedOrders) {
+    if (!ownsMember(member.id, order.memberId)) continue;
+    addSize(sizes, order.asset, order.size.toStroops());
+  }
+
+  let total = 0n;
+  for (const [asset, size] of sizes) {
+    if (size === 0n) continue;
+    total += notionalStroops(size, requirePrice(prices, asset).toStroops());
+  }
+  return FixedPointDecimal.fromStroops(total);
+}
+
+function aggregateExposures(
+  portfolio: PortfolioView,
+  proposedOrders: readonly Order[],
+  prices: ReadonlyMap<AssetSymbol, FixedPointDecimal>
+): ReadonlyMap<AssetSymbol, FixedPointDecimal> {
+  const sizes = new Map<AssetSymbol, bigint>();
+  for (const position of portfolio.positions()) {
+    sizes.set(
+      position.asset,
+      (sizes.get(position.asset) ?? 0n) + position.size.toStroops()
+    );
+  }
+  for (const order of proposedOrders) {
+    sizes.set(
+      order.asset,
+      (sizes.get(order.asset) ?? 0n) + order.size.toStroops()
+    );
+  }
+
+  const totalStroops = portfolio.totalValue(prices).toStroops();
+  const exposures = new Map<AssetSymbol, FixedPointDecimal>();
+  for (const [asset, size] of sizes) {
+    if (size === 0n) continue;
+    const price = requirePrice(prices, asset);
+    const notional = notionalStroops(size, price.toStroops());
+    exposures.set(
+      asset,
+      FixedPointDecimal.fromStroops((notional * UNIT) / totalStroops)
+    );
+  }
+  return exposures;
+}
+
+function projectedCash(
+  portfolio: PortfolioView,
+  proposedOrders: readonly Order[],
+  prices: ReadonlyMap<AssetSymbol, FixedPointDecimal>
+): FixedPointDecimal {
+  let cash = portfolio.cash;
+  for (const order of proposedOrders) {
+    const price = requirePrice(prices, order.asset);
+    cash = cash.sub(order.size.mul(price));
+  }
+  return cash;
+}
+
+function currentAssetExposureStroops(
+  portfolio: PortfolioView,
+  asset: AssetSymbol,
+  price: bigint
+): bigint {
+  let total = 0n;
+  for (const position of portfolio.positions()) {
+    if (position.asset !== asset) continue;
+    total += notionalStroops(position.size.toStroops(), price);
+  }
+  return total;
+}
+
+function currentMemberSize(
+  portfolio: PortfolioView,
+  memberId: string | undefined,
+  asset: AssetSymbol
+): bigint {
+  const position = portfolio
+    .positions()
+    .find(
+      (candidate) =>
+        candidate.asset === asset && candidate.memberId === memberId
+    );
+  return position?.size.toStroops() ?? 0n;
 }
 
 function describeViolation(violation: ConstraintViolation): string {

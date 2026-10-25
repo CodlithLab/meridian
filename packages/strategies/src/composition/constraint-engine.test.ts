@@ -8,7 +8,7 @@ import {
   type CompositionConstraints,
   type MemberView,
 } from "./constraint-engine";
-import { FixedPointDecimal } from "../types";
+import { FixedPointDecimal, UnknownAssetError } from "../types";
 import type { AssetSymbol } from "../types";
 import type { PortfolioView, PositionView } from "../strategy";
 
@@ -137,9 +137,7 @@ describe("validateComposition – member-weight", () => {
       makeMember("a", "0", [{ asset: USDC, size: "500" }]),
       makeMember("b", "0", [{ asset: USDC, size: "500" }]),
     ];
-    const portfolio = makePortfolio("0", [
-      { asset: USDC, size: "1000" },
-    ]);
+    const portfolio = makePortfolio("0", [{ asset: USDC, size: "1000" }]);
     const result = validateComposition(
       { maxMemberWeight: D("0.6") },
       members,
@@ -181,9 +179,7 @@ describe("validateComposition – aggregate-exposure", () => {
       makeMember("a", "0", [{ asset: USDC, size: "300" }]),
       makeMember("b", "0", [{ asset: USDC, size: "200" }]),
     ];
-    const portfolio = makePortfolio("500", [
-      { asset: USDC, size: "500" },
-    ]);
+    const portfolio = makePortfolio("500", [{ asset: USDC, size: "500" }]);
     // total value = 500 cash + 500 USDC = 1000
     // aggregate USDC exposure = (300 + 200) / 1000 = 0.5
     const result = validateComposition(
@@ -285,9 +281,7 @@ describe("validateComposition – cash-buffer", () => {
 
 describe("enforceReject", () => {
   it("does nothing when the composition is valid", () => {
-    expect(() =>
-      enforceReject({ valid: true, violations: [] })
-    ).not.toThrow();
+    expect(() => enforceReject({ valid: true, violations: [] })).not.toThrow();
   });
 
   it("throws a CompositionConstraintError naming the violated constraint", () => {
@@ -347,35 +341,31 @@ describe("enforceReject", () => {
 describe("enforceClamp", () => {
   it("returns orders unchanged when the composition is valid", () => {
     const orders = [{ asset: USDC, size: D("100") }];
+    const portfolio = makePortfolio("900", [{ asset: USDC, size: "100" }]);
     const result = enforceClamp(
       { valid: true, violations: [] },
       orders,
       PRICES,
       D("1000"),
-      { maxAggregateExposure: D("0.6") }
+      portfolio
     );
     expect(result.orders).toHaveLength(1);
     expect(result.orders[0]?.size.toString()).toBe("100");
     expect(result.clampedViolations).toHaveLength(0);
   });
 
-  it("scales down orders to fit within the aggregate-exposure limit", () => {
-    // total value = 1000, limit = 50%, max notional = 500
-    // proposed orders sum to 600 notional → should be scaled to 500
-    const orders = [
-      { asset: USDC, size: D("400") },
-      { asset: USDC, size: D("200") },
-    ];
-    const members = [
-      makeMember("a", "0", [{ asset: USDC, size: "400" }]),
-      makeMember("b", "0", [{ asset: USDC, size: "200" }]),
-    ];
-    const portfolio = makePortfolio("400", [{ asset: USDC, size: "600" }]);
+  it("scales down the increasing orders to the available exposure", () => {
+    // current exposure 300, total value 1000, limit 60% -> target 600
+    // proposed buy 400 would reach 700, so clamp it to 300
+    const orders = [{ asset: USDC, size: D("400") }];
+    const members = [makeMember("a", "0", [{ asset: USDC, size: "300" }])];
+    const portfolio = makePortfolio("700", [{ asset: USDC, size: "300" }]);
     const validationResult = validateComposition(
-      { maxAggregateExposure: D("0.5") },
+      { maxAggregateExposure: D("0.6") },
       members,
       portfolio,
-      PRICES
+      PRICES,
+      orders
     );
     expect(validationResult.valid).toBe(false);
 
@@ -384,20 +374,17 @@ describe("enforceClamp", () => {
       orders,
       PRICES,
       D("1000"),
-      { maxAggregateExposure: D("0.5") }
+      portfolio
     );
 
-    // Total clamped size should be ≤ 500
-    const totalSize = clampResult.orders.reduce(
-      (sum, o) => sum + o.size.toStroops(),
-      0n
-    );
-    expect(totalSize).toBeLessThanOrEqual(D("500").toStroops());
-    expect(clampResult.clampedViolations.length).toBeGreaterThan(0);
+    expect(clampResult.orders[0]?.size.toString()).toBe("300");
+    expect(clampResult.clampedViolations).toHaveLength(1);
+    expect(clampResult.clampedViolations[0]?.kind).toBe("aggregate-exposure");
+    const postTrade = D("300").add(clampResult.orders[0]!.size);
+    expect(postTrade.toString()).toBe("600");
   });
 
-  it("reports non-order violations in clampedViolations without altering orders", () => {
-    // member-count violation cannot be fixed by clamping orders
+  it("throws when a non-order violation cannot be fixed by clamping", () => {
     const members = [
       makeMember("a", "100", []),
       makeMember("b", "100", []),
@@ -412,19 +399,26 @@ describe("enforceClamp", () => {
     );
 
     const orders = [{ asset: USDC, size: D("50") }];
-    const clampResult = enforceClamp(
-      result,
-      orders,
+    expect(() =>
+      enforceClamp(result, orders, PRICES, D("300"), portfolio)
+    ).toThrow(CompositionConstraintError);
+  });
+
+  it("throws when existing exposure already breaches the limit", () => {
+    const orders = [{ asset: USDC, size: D("100") }];
+    const members = [makeMember("a", "0", [{ asset: USDC, size: "600" }])];
+    const portfolio = makePortfolio("400", [{ asset: USDC, size: "600" }]);
+    const result = validateComposition(
+      { maxAggregateExposure: D("0.5") },
+      members,
+      portfolio,
       PRICES,
-      D("300"),
-      { maxMemberCount: 2 }
+      orders
     );
 
-    // Orders unchanged (no aggregate-exposure violation to clamp)
-    expect(clampResult.orders[0]?.size.toString()).toBe("50");
-    expect(
-      clampResult.clampedViolations.some((v) => v.kind === "member-count")
-    ).toBe(true);
+    expect(() =>
+      enforceClamp(result, orders, PRICES, D("1000"), portfolio)
+    ).toThrow(/current exposure already breaches/);
   });
 });
 
@@ -471,12 +465,7 @@ describe("invalid constraint definitions", () => {
 
   it("throws when maxMemberCount is less than 1", () => {
     expect(() =>
-      validateComposition(
-        { maxMemberCount: 0 },
-        members,
-        portfolio,
-        PRICES
-      )
+      validateComposition({ maxMemberCount: 0 }, members, portfolio, PRICES)
     ).toThrow(CompositionConstraintError);
   });
 
@@ -493,12 +482,7 @@ describe("invalid constraint definitions", () => {
 
   it("throws when minCashBuffer equals 1", () => {
     expect(() =>
-      validateComposition(
-        { minCashBuffer: D("1") },
-        members,
-        portfolio,
-        PRICES
-      )
+      validateComposition({ minCashBuffer: D("1") }, members, portfolio, PRICES)
     ).toThrow(CompositionConstraintError);
   });
 
@@ -533,23 +517,21 @@ describe("edge cases", () => {
     expect(result.violations).toHaveLength(0);
   });
 
-  it("skips assets with no price when checking aggregate exposure", () => {
+  it("throws when a held asset has no price", () => {
     const noPrices: ReadonlyMap<AssetSymbol, FixedPointDecimal> = new Map([
       [USDC, D("1")],
       // EURC has no price
     ]);
-    const members = [
-      makeMember("a", "0", [{ asset: EURC, size: "1000" }]),
-    ];
+    const members = [makeMember("a", "0", [{ asset: EURC, size: "1000" }])];
     const portfolio = makePortfolio("1000", [{ asset: EURC, size: "1000" }]);
-    // Should not throw and EURC should be skipped
-    const result = validateComposition(
-      { maxAggregateExposure: D("0.1") },
-      members,
-      portfolio,
-      noPrices
-    );
-    // EURC skipped (no price), no violation
-    expect(result.violations.filter((v) => v.kind === "aggregate-exposure")).toHaveLength(0);
+
+    expect(() =>
+      validateComposition(
+        { maxAggregateExposure: D("0.1") },
+        members,
+        portfolio,
+        noPrices
+      )
+    ).toThrow(UnknownAssetError);
   });
 });
