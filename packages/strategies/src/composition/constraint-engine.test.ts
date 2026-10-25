@@ -5,7 +5,6 @@ import {
   enforceClamp,
   CompositionConstraintError,
   isCompositionConstraintError,
-  type CompositionConstraints,
   type MemberView,
 } from "./constraint-engine";
 import { FixedPointDecimal, UnknownAssetError } from "../types";
